@@ -1,14 +1,13 @@
-import os
 import cv2
 import numpy as np
 from scipy.signal import butter
-from scipy.ndimage import convolve, gaussian_filter, pyramid_reduce, pyramid_expand
+from scipy.ndimage import convolve, gaussian_filter
 
 
 class RieszVideoMagnifier:
     """
-    Python translation of the Quaternionic Riesz Pyramid Pseudocode 
-    by Neal Wadhwa et al. (MIT CSAIL, ICCP 2014).
+    Riesz Pyramid Motion Magnifier based on MIT CSAIL research.
+    Uses OpenCV pyrDown/pyrUp for fast, robust Laplacian Pyramids.
     """
 
     def __init__(self, num_levels=3, alpha=15.0, low_cutoff=0.8, high_cutoff=2.5, fps=30.0):
@@ -36,16 +35,6 @@ class RieszVideoMagnifier:
         high = np.clip(self.high_cutoff / nyquist, low + 0.001, 0.999)
         self.b, self.a = butter(1, [low, high], btype='band')
 
-    def set_parameters(self, alpha=None, low_cutoff=None, high_cutoff=None):
-        """Dynamically update magnification and temporal filter settings."""
-        if alpha is not None:
-            self.alpha = alpha
-        if low_cutoff is not None:
-            self.low_cutoff = low_cutoff
-        if high_cutoff is not None:
-            self.high_cutoff = high_cutoff
-        self._update_filter()
-
     def reset_state(self):
         """Clears frame history and phase registers."""
         self.initialized = False
@@ -58,17 +47,13 @@ class RieszVideoMagnifier:
         self.reg0_sin, self.reg1_sin = [], []
 
     def build_laplacian_pyramid(self, image):
-        """Builds Laplacian pyramid levels and lowpass residual."""
+        """Builds Laplacian pyramid using OpenCV's pyrDown and pyrUp."""
         pyramid = []
         current = image.astype(np.float32)
 
         for _ in range(self.num_levels):
-            down = pyramid_reduce(current, channel_axis=None)
-            up = pyramid_expand(down, channel_axis=None)
-
-            if up.shape != current.shape:
-                up = up[:current.shape[0], :current.shape[1]]
-
+            down = cv2.pyrDown(current)
+            up = cv2.pyrUp(down, dstsize=(current.shape[1], current.shape[0]))
             lap = current - up
             pyramid.append(lap)
             current = down
@@ -80,9 +65,7 @@ class RieszVideoMagnifier:
         """Reconstructs frame from Laplacian pyramid."""
         current = pyramid[-1]
         for lap in reversed(pyramid[:-1]):
-            up = pyramid_expand(current, channel_axis=None)
-            if up.shape != lap.shape:
-                up = up[:lap.shape[0], :lap.shape[1]]
+            up = cv2.pyrUp(current, dstsize=(lap.shape[1], lap.shape[0]))
             current = lap + up
         return current
 
@@ -101,7 +84,7 @@ class RieszVideoMagnifier:
         return filtered, new_reg0, new_reg1
 
     def amplitude_weighted_blur(self, phase, amplitude, sigma=2.0):
-        """Spatially smooths phase weighted by local amplitude."""
+        """Spatially smooths phase weighted by local feature amplitude."""
         num = gaussian_filter(phase * amplitude, sigma=sigma)
         den = gaussian_filter(amplitude, sigma=sigma) + 1e-8
         return num / den
@@ -193,12 +176,13 @@ class RieszVideoMagnifier:
         return out_frame
 
 
-def run_motion_magnification(video_path, output_path="magnified_output.mp4"):
-    if not os.path.exists(video_path):
-        print(f"Error: Video file '{video_path}' not found!")
+def magnify_video(input_path, output_path="output_magnified.mp4", alpha=15.0, low_cutoff=0.8, high_cutoff=2.5):
+    """Reads a video, runs motion magnification, and saves the output."""
+    cap = cv2.VideoCapture(input_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open input video '{input_path}'")
         return
 
-    cap = cv2.VideoCapture(video_path)
     fps = cap.get(cv2.CAP_PROP_FPS)
     if fps <= 0:
         fps = 30.0
@@ -210,19 +194,10 @@ def run_motion_magnification(video_path, output_path="magnified_output.mp4"):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height), isColor=True)
 
-    # Initialize Riesz Magnifier
-    magnifier = RieszVideoMagnifier(num_levels=3, alpha=15.0, low_cutoff=0.8, high_cutoff=2.5, fps=fps)
+    magnifier = RieszVideoMagnifier(num_levels=3, alpha=alpha, low_cutoff=low_cutoff, high_cutoff=high_cutoff, fps=fps)
 
-    # Interactive UI Controls
-    window_name = "Riesz Motion Magnifier (Original vs Magnified)"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.createTrackbar("Alpha (Amplification)", window_name, 15, 100, lambda x: None)
-    cv2.createTrackbar("Low Cutoff (Hz x10)", window_name, 8, 100, lambda x: None)
-    cv2.createTrackbar("High Cutoff (Hz x10)", window_name, 25, 100, lambda x: None)
-
-    print("\n--- Starting Motion Magnification ---")
-    print(f"Input: {video_path}")
-    print("Press 'q' or 'ESC' to stop early.\n")
+    print(f"\nProcessing Video: {input_path}")
+    print(f"Resolution: {width}x{height} | FPS: {fps} | Total Frames: {total_frames}\n")
 
     frame_idx = 0
     while cap.isOpened():
@@ -230,52 +205,31 @@ def run_motion_magnification(video_path, output_path="magnified_output.mp4"):
         if not ret:
             break
 
-        # Read slider parameters
-        alpha = cv2.getTrackbarPos("Alpha (Amplification)", window_name)
-        low_c = max(1, cv2.getTrackbarPos("Low Cutoff (Hz x10)", window_name)) / 10.0
-        high_c = max(low_c * 10 + 1, cv2.getTrackbarPos("High Cutoff (Hz x10)", window_name)) / 10.0
-
-        magnifier.set_parameters(alpha=alpha, low_cutoff=low_c, high_cutoff=high_c)
-
-        # Convert BGR -> YUV to amplify motion in Y (luminance channel)
+        # Convert to YUV color space to magnify luminance (Y)
         yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
         y_channel = yuv[:, :, 0].astype(np.float32) / 255.0
 
-        # Run Riesz Pyramid motion magnification
+        # Motion Magnification
         y_magnified = magnifier.process_frame(y_channel)
 
-        # Reconstruct BGR image
+        # Reconstruct BGR
         yuv[:, :, 0] = np.clip(y_magnified * 255.0, 0, 255).astype(np.uint8)
         frame_out = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
 
-        # Save to video file
         out.write(frame_out)
 
-        # Display side-by-side comparison
-        combined_display = np.hstack((frame, frame_out))
-        cv2.imshow(window_name, combined_display)
-
         frame_idx += 1
-        if frame_idx % 15 == 0:
-            print(f"Processing frame {frame_idx}/{total_frames if total_frames > 0 else 'Unknown'}")
-
-        # Break loop on 'q' or ESC
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or key == 27:
-            print("Processing interrupted by user.")
-            break
+        if frame_idx % 15 == 0 or frame_idx == total_frames:
+            print(f"Processed frame {frame_idx}/{total_frames}")
 
     cap.release()
     out.release()
-    cv2.destroyAllWindows()
-    print(f"\nDone! Magnified output saved as: {os.path.abspath(output_path)}")
+    print(f"\nSuccess! Magnified video saved to: {output_path}")
 
 
 if __name__ == "__main__":
-    # -------------------------------------------------------------
-    # PASS YOUR VIDEO FILE PATH HERE
-    # -------------------------------------------------------------
-    input_video_file = "mute.mp4"  # <-- Change to your video filename
-    output_video_file = "mute_magnified.mp4"
+    # Change 'input_video.mp4' to your video file name
+    input_file = "mute.mp4"
+    output_file = "mute_magnified.mp4"
 
-    run_motion_magnification(input_video_file, output_video_file)
+    magnify_video(input_file, output_file, alpha=15.0, low_cutoff=0.8, high_cutoff=2.5)
