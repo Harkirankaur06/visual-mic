@@ -1,235 +1,225 @@
+
 import cv2
 import numpy as np
-from scipy.signal import butter
-from scipy.ndimage import convolve, gaussian_filter
+from scipy.signal import butter, sosfiltfilt
 
 
-class RieszVideoMagnifier:
+def amplify_video(
+    input_path,
+    output_path="amplified_for_audio.mp4",
+    alpha=20.0,
+    low_hz=0.5,
+    high_hz=None,
+    levels=3,
+):
     """
-    Riesz Pyramid Motion Magnifier based on MIT CSAIL research.
-    Uses OpenCV pyrDown/pyrUp for fast, robust Laplacian Pyramids.
+    Broadband temporal motion amplification.
+
+    This replaces the original 0.8-2.5 Hz restriction with a band that
+    extends toward the video's Nyquist frequency. That preserves as much
+    temporal motion as the camera actually sampled.
+
+    IMPORTANT:
+    Normal video still cannot recover frequencies above FPS/2.
+    This code amplifies motion; it does not create missing audio samples.
     """
 
-    def __init__(self, num_levels=3, alpha=15.0, low_cutoff=0.8, high_cutoff=2.5, fps=30.0):
-        self.num_levels = num_levels
-        self.alpha = alpha
-        self.fps = fps
-        self.low_cutoff = low_cutoff
-        self.high_cutoff = high_cutoff
-
-        # Riesz derivative kernels (Central Difference Approximations)
-        self.kernel_x = np.array([[0.0, 0.0, 0.0],
-                                  [0.5, 0.0, -0.5],
-                                  [0.0, 0.0, 0.0]], dtype=np.float32)
-        self.kernel_y = np.array([[0.0, 0.5, 0.0],
-                                  [0.0, 0.0, 0.0],
-                                  [0.0, -0.5, 0.0]], dtype=np.float32)
-
-        self._update_filter()
-        self.reset_state()
-
-    def _update_filter(self):
-        """Updates 1st-order IIR Butterworth temporal bandpass filter."""
-        nyquist = self.fps / 2.0
-        low = np.clip(self.low_cutoff / nyquist, 0.001, 0.99)
-        high = np.clip(self.high_cutoff / nyquist, low + 0.001, 0.999)
-        self.b, self.a = butter(1, [low, high], btype='band')
-
-    def reset_state(self):
-        """Clears frame history and phase registers."""
-        self.initialized = False
-        self.prev_lap = None
-        self.prev_rx = None
-        self.prev_ry = None
-
-        self.phase_cos, self.phase_sin = [], []
-        self.reg0_cos, self.reg1_cos = [], []
-        self.reg0_sin, self.reg1_sin = [], []
-
-    def build_laplacian_pyramid(self, image):
-        """Builds Laplacian pyramid using OpenCV's pyrDown and pyrUp."""
-        pyramid = []
-        current = image.astype(np.float32)
-
-        for _ in range(self.num_levels):
-            down = cv2.pyrDown(current)
-            up = cv2.pyrUp(down, dstsize=(current.shape[1], current.shape[0]))
-            lap = current - up
-            pyramid.append(lap)
-            current = down
-
-        pyramid.append(current)  # Lowpass residual
-        return pyramid
-
-    def collapse_laplacian_pyramid(self, pyramid):
-        """Reconstructs frame from Laplacian pyramid."""
-        current = pyramid[-1]
-        for lap in reversed(pyramid[:-1]):
-            up = cv2.pyrUp(current, dstsize=(lap.shape[1], lap.shape[0]))
-            current = lap + up
-        return current
-
-    def compute_riesz_pyramid(self, frame):
-        """Computes Laplacian pyramid and 2D Riesz transform components (X, Y)."""
-        lap_pyr = self.build_laplacian_pyramid(frame)
-        riesz_x = [convolve(level, self.kernel_x, mode='nearest') for level in lap_pyr[:-1]]
-        riesz_y = [convolve(level, self.kernel_y, mode='nearest') for level in lap_pyr[:-1]]
-        return lap_pyr, riesz_x, riesz_y
-
-    def iir_filter(self, phase, reg0, reg1):
-        """Direct Form II IIR temporal filter."""
-        filtered = self.b[0] * phase + reg0
-        new_reg0 = self.b[1] * phase + reg1 - self.a[1] * filtered
-        new_reg1 = self.b[2] * phase - self.a[2] * filtered
-        return filtered, new_reg0, new_reg1
-
-    def amplitude_weighted_blur(self, phase, amplitude, sigma=2.0):
-        """Spatially smooths phase weighted by local feature amplitude."""
-        num = gaussian_filter(phase * amplitude, sigma=sigma)
-        den = gaussian_filter(amplitude, sigma=sigma) + 1e-8
-        return num / den
-
-    def compute_phase_diff(self, curr_r, curr_x, curr_y, prev_r, prev_x, prev_y):
-        """Quaternion conjugate multiplication and logarithm for phase extraction."""
-        q_real = curr_r * prev_r + curr_x * prev_x + curr_y * prev_y
-        q_x = -curr_r * prev_x + prev_r * curr_x
-        q_y = -curr_r * prev_y + prev_r * curr_y
-
-        q_amp = np.sqrt(q_real**2 + q_x**2 + q_y**2) + 1e-8
-        phase_diff = np.arccos(np.clip(q_real / q_amp, -1.0, 1.0))
-
-        denom = np.sqrt(q_x**2 + q_y**2) + 1e-8
-        cos_orient = q_x / denom
-        sin_orient = q_y / denom
-
-        phase_diff_cos = phase_diff * cos_orient
-        phase_diff_sin = phase_diff * sin_orient
-        amplitude = np.sqrt(q_amp)
-
-        return phase_diff_cos, phase_diff_sin, amplitude
-
-    def process_frame(self, frame_gray):
-        """Processes a single grayscale frame [0.0, 1.0]."""
-        curr_lap, curr_rx, curr_ry = self.compute_riesz_pyramid(frame_gray)
-
-        if not self.initialized:
-            self.prev_lap, self.prev_rx, self.prev_ry = curr_lap, curr_rx, curr_ry
-            for k in range(self.num_levels):
-                shape = curr_lap[k].shape
-                self.phase_cos.append(np.zeros(shape, dtype=np.float32))
-                self.phase_sin.append(np.zeros(shape, dtype=np.float32))
-                self.reg0_cos.append(np.zeros(shape, dtype=np.float32))
-                self.reg1_cos.append(np.zeros(shape, dtype=np.float32))
-                self.reg0_sin.append(np.zeros(shape, dtype=np.float32))
-                self.reg1_sin.append(np.zeros(shape, dtype=np.float32))
-            self.initialized = True
-            return frame_gray
-
-        magnified_lap = []
-
-        for k in range(self.num_levels):
-            # 1. Quaternionic phase difference
-            d_cos, d_sin, amp = self.compute_phase_diff(
-                curr_lap[k], curr_rx[k], curr_ry[k],
-                self.prev_lap[k], self.prev_rx[k], self.prev_ry[k]
-            )
-
-            # 2. Accumulate / unwrap phase
-            self.phase_cos[k] += d_cos
-            self.phase_sin[k] += d_sin
-
-            # 3. IIR Temporal filter
-            f_cos, self.reg0_cos[k], self.reg1_cos[k] = self.iir_filter(
-                self.phase_cos[k], self.reg0_cos[k], self.reg1_cos[k]
-            )
-            f_sin, self.reg0_sin[k], self.reg1_sin[k] = self.iir_filter(
-                self.phase_sin[k], self.reg0_sin[k], self.reg1_sin[k]
-            )
-
-            # 4. Amplitude-weighted spatial blur
-            f_cos = self.amplitude_weighted_blur(f_cos, amp)
-            f_sin = self.amplitude_weighted_blur(f_sin, amp)
-
-            # 5. Phase amplification
-            mag_cos = self.alpha * f_cos
-            mag_sin = self.alpha * f_sin
-
-            # 6. Reconstitute real part after phase shift
-            phase_mag = np.sqrt(mag_cos**2 + mag_sin**2) + 1e-8
-            exp_real = np.cos(phase_mag)
-            exp_x = (mag_cos / phase_mag) * np.sin(phase_mag)
-            exp_y = (mag_sin / phase_mag) * np.sin(phase_mag)
-
-            res_real = exp_real * curr_lap[k] - exp_x * curr_rx[k] - exp_y * curr_ry[k]
-            magnified_lap.append(res_real)
-
-        # Append lowpass residual
-        magnified_lap.append(curr_lap[-1])
-
-        # Collapse pyramid
-        out_frame = self.collapse_laplacian_pyramid(magnified_lap)
-        out_frame = np.clip(out_frame, 0.0, 1.0)
-
-        # Update previous frame
-        self.prev_lap, self.prev_rx, self.prev_ry = curr_lap, curr_rx, curr_ry
-
-        return out_frame
-
-
-def magnify_video(input_path, output_path="output_magnified.mp4", alpha=15.0, low_cutoff=0.8, high_cutoff=2.5):
-    """Reads a video, runs motion magnification, and saves the output."""
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        print(f"Error: Could not open input video '{input_path}'")
-        return
+        raise RuntimeError(f"Could not open: {input_path}")
 
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
-        fps = 30.0
-
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height), isColor=True)
+    if fps <= 0:
+        raise RuntimeError("Could not determine video FPS.")
 
-    magnifier = RieszVideoMagnifier(num_levels=3, alpha=alpha, low_cutoff=low_cutoff, high_cutoff=high_cutoff, fps=fps)
+    nyquist = fps / 2.0
 
-    print(f"\nProcessing Video: {input_path}")
-    print(f"Resolution: {width}x{height} | FPS: {fps} | Total Frames: {total_frames}\n")
+    if high_hz is None:
+        high_hz = 0.90 * nyquist
 
-    frame_idx = 0
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
+    high_hz = min(high_hz, 0.95 * nyquist)
+
+    if low_hz <= 0 or high_hz <= low_hz:
+        raise ValueError(
+            f"Invalid temporal band {low_hz}-{high_hz} Hz "
+            f"for {fps:.3f} FPS video."
+        )
+
+    print(f"FPS:       {fps:.4f}")
+    print(f"Nyquist:   {nyquist:.4f} Hz")
+    print(f"Band:      {low_hz:.4f} - {high_hz:.4f} Hz")
+    print(f"Alpha:     {alpha}")
+
+    # Offline zero-phase temporal filter.
+    sos = butter(
+        2,
+        [low_hz, high_hz],
+        btype="bandpass",
+        fs=fps,
+        output="sos",
+    )
+
+    # Read the video.
+    luminance = []
+    chroma = []
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
             break
 
-        # Convert to YUV color space to magnify luminance (Y)
-        yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
-        y_channel = yuv[:, :, 0].astype(np.float32) / 255.0
+        ycrcb = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
 
-        # Motion Magnification
-        y_magnified = magnifier.process_frame(y_channel)
-
-        # Reconstruct BGR
-        yuv[:, :, 0] = np.clip(y_magnified * 255.0, 0, 255).astype(np.uint8)
-        frame_out = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
-
-        out.write(frame_out)
-
-        frame_idx += 1
-        if frame_idx % 15 == 0 or frame_idx == total_frames:
-            print(f"Processed frame {frame_idx}/{total_frames}")
+        y = ycrcb[:, :, 0].astype(np.float32) / 255.0
+        luminance.append(y)
+        chroma.append(ycrcb[:, :, 1:3].copy())
 
     cap.release()
-    out.release()
-    print(f"\nSuccess! Magnified video saved to: {output_path}")
+
+    n = len(luminance)
+
+    if n < 12:
+        raise RuntimeError(
+            f"Only {n} frames found. Use a longer video."
+        )
+
+    print(f"Frames:    {n}")
+    print(f"Duration:  {n / fps:.3f} seconds")
+
+    video = np.stack(luminance, axis=0)
+
+    # Build Laplacian pyramids.
+    pyramids = []
+
+    for i in range(n):
+        current = video[i]
+        pyr = []
+
+        for _ in range(levels):
+            down = cv2.pyrDown(current)
+            up = cv2.pyrUp(
+                down,
+                dstsize=(current.shape[1], current.shape[0]),
+            )
+            pyr.append(current - up)
+            current = down
+
+        pyr.append(current)
+        pyramids.append(pyr)
+
+    # Amplify each spatial band across time.
+    amplified_pyramid = []
+
+    for level in range(levels):
+        stack = np.stack(
+            [pyramids[t][level] for t in range(n)],
+            axis=0,
+        )
+
+        motion = sosfiltfilt(sos, stack, axis=0)
+
+        # Add only the filtered motion back to the original.
+        amplified = stack + alpha * motion
+        amplified_pyramid.append(amplified)
+
+        print(f"Amplified pyramid level {level + 1}/{levels}")
+
+    # Keep the low-frequency residual unchanged.
+    amplified_pyramid.append(
+        np.stack(
+            [pyramids[t][-1] for t in range(n)],
+            axis=0,
+        )
+    )
+
+    # Reconstruct frames.
+    writer = cv2.VideoWriter(
+        output_path,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        fps,
+        (width, height),
+        True,
+    )
+
+    if not writer.isOpened():
+        raise RuntimeError(f"Could not create: {output_path}")
+
+    for t in range(n):
+        current = amplified_pyramid[-1][t]
+
+        for level in reversed(range(levels)):
+            current = cv2.pyrUp(
+                current,
+                dstsize=(
+                    amplified_pyramid[level][t].shape[1],
+                    amplified_pyramid[level][t].shape[0],
+                ),
+            )
+            current += amplified_pyramid[level][t]
+
+        y8 = np.clip(current * 255.0, 0, 255).astype(np.uint8)
+
+        ycrcb = np.empty((height, width, 3), dtype=np.uint8)
+        ycrcb[:, :, 0] = y8
+        ycrcb[:, :, 1:3] = chroma[t]
+
+        out_frame = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+        writer.write(out_frame)
+
+        if (t + 1) % 10 == 0 or t == n - 1:
+            print(f"Written {t + 1}/{n} frames")
+
+    writer.release()
+
+    print()
+    print(f"Saved: {output_path}")
+    print(f"Output duration: {n / fps:.3f} seconds")
 
 
 if __name__ == "__main__":
-    # Change 'input_video.mp4' to your video file name
-    input_file = "mute.mp4"
-    output_file = "mute_magnified.mp4"
+    import argparse
 
-    magnify_video(input_file, output_file, alpha=15.0, low_cutoff=0.8, high_cutoff=2.5)
+    parser = argparse.ArgumentParser(
+        description="Broadband temporal motion amplification"
+    )
+
+    parser.add_argument("input", help="Input video")
+    parser.add_argument(
+        "--output",
+        default="amplified_for_audio.mp4",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=20.0,
+    )
+    parser.add_argument(
+        "--low",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--high",
+        type=float,
+        default=None,
+        help="Default: 90%% of Nyquist",
+    )
+    parser.add_argument(
+        "--levels",
+        type=int,
+        default=3,
+    )
+
+    args = parser.parse_args()
+
+    amplify_video(
+        args.input,
+        args.output,
+        alpha=args.alpha,
+        low_hz=args.low,
+        high_hz=args.high,
+        levels=args.levels,
+    )
